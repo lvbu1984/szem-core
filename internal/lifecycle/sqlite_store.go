@@ -30,6 +30,14 @@ func OpenSQLite(path string) (*SQLiteStore, error) {
 	return store, nil
 }
 
+func (s *SQLiteStore) DB() *sql.DB {
+	return s.db
+}
+
+func (s *SQLiteStore) Close() error {
+	return s.db.Close()
+}
+
 func (s *SQLiteStore) migrate() error {
 	_, err := s.db.Exec(`
 CREATE TABLE IF NOT EXISTS users (
@@ -54,11 +62,12 @@ CREATE TABLE IF NOT EXISTS objects (
 CREATE TABLE IF NOT EXISTS leases (
 	lease_id TEXT PRIMARY KEY,
 	object_id TEXT NOT NULL,
-	bucket TEXT NOT NULL,
-	object_key TEXT NOT NULL,
+	bucket TEXT,
+	object_key TEXT,
 	wallet TEXT NOT NULL,
 	created_at TEXT NOT NULL,
 	expire_at TEXT NOT NULL,
+	deleted_at TEXT,
 	dataset_id TEXT,
 	piece_cid TEXT
 );
@@ -66,17 +75,15 @@ CREATE TABLE IF NOT EXISTS leases (
 	return err
 }
 
-func (s *SQLiteStore) Close() error {
-	return s.db.Close()
-}
-
 func iso(t time.Time) string {
 	return t.UTC().Format(time.RFC3339Nano)
 }
 
-// =========================
-// Insert Methods
-// =========================
+//
+// ============================
+// INSERT METHODS
+// ============================
+//
 
 func (s *SQLiteStore) InsertUser(wallet string) {
 	_, _ = s.db.Exec(
@@ -111,9 +118,9 @@ func (s *SQLiteStore) InsertLease(l ObjectLease) {
 	_, _ = s.db.Exec(`
 INSERT INTO leases(
 	lease_id, object_id, bucket, object_key, wallet,
-	created_at, expire_at, dataset_id, piece_cid
+	created_at, expire_at, deleted_at, dataset_id, piece_cid
 )
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `,
 		l.LeaseID,
 		l.ObjectID,
@@ -122,29 +129,86 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		l.Wallet,
 		iso(l.CreatedAt),
 		iso(l.ExpireAt),
+		nil,
 		l.StorageRef.DataSetID,
 		l.StorageRef.PieceCID,
 	)
 }
 
-// =========================
-// Dashboard
-// =========================
+//
+// ============================
+// LEASE QUERIES
+// ============================
+//
 
-type InternalStats struct {
+func (s *SQLiteStore) GetActiveLeaseByObjectID(objectID string) (*ObjectLease, error) {
+	row := s.db.QueryRow(`
+SELECT lease_id, object_id, wallet, created_at, expire_at, deleted_at, dataset_id, piece_cid
+FROM leases
+WHERE object_id = ?
+ORDER BY created_at DESC
+LIMIT 1
+`, objectID)
+
+	var lease ObjectLease
+	var createdStr, expireStr string
+	var deletedStr sql.NullString
+	var datasetID, pieceCID string
+
+	err := row.Scan(
+		&lease.LeaseID,
+		&lease.ObjectID,
+		&lease.Wallet,
+		&createdStr,
+		&expireStr,
+		&deletedStr,
+		&datasetID,
+		&pieceCID,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	lease.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)
+	lease.ExpireAt, _ = time.Parse(time.RFC3339Nano, expireStr)
+
+	if deletedStr.Valid {
+		t, _ := time.Parse(time.RFC3339Nano, deletedStr.String)
+		lease.DeletedAt = &t
+	}
+
+	lease.StorageRef = StorageRef{
+		DataSetID: datasetID,
+		PieceCID:  pieceCID,
+	}
+
+	return &lease, nil
+}
+
+//
+// ============================
+// DASHBOARD (EXTENDED STATS)
+// ============================
+//
+
+type ExtendedStats struct {
 	TotalUsers        int64
 	TotalStorageBytes int64
 	NewUsersToday     int64
 	StorageTodayBytes int64
 	ExpiringIn7Days   int64
+
+	ActiveObjects  int64
+	ExpiredObjects int64
+	DeletedObjects int64
 }
 
-func (s *SQLiteStore) GetInternalStats() (*InternalStats, error) {
+func (s *SQLiteStore) GetExtendedStats() (*ExtendedStats, error) {
 	now := time.Now().UTC()
 	today := now.Truncate(24 * time.Hour)
 	in7days := now.Add(7 * 24 * time.Hour)
 
-	stats := &InternalStats{}
+	stats := &ExtendedStats{}
 
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&stats.TotalUsers)
 
@@ -168,67 +232,49 @@ func (s *SQLiteStore) GetInternalStats() (*InternalStats, error) {
 		iso(in7days),
 	).Scan(&stats.ExpiringIn7Days)
 
-	return stats, nil
-}
-
-// =========================
-// Expiration + Deletion
-// =========================
-
-func (s *SQLiteStore) GetExpiredLeases() ([]ObjectLease, error) {
 	rows, err := s.db.Query(`
-SELECT lease_id, object_id, bucket, object_key, wallet,
-       created_at, expire_at, dataset_id, piece_cid
+SELECT lease_id, object_id, wallet, created_at, expire_at, deleted_at
 FROM leases
-WHERE expire_at <= ? AND deleted_at IS NULL
-`, iso(time.Now()))
+`)
 	if err != nil {
-		return nil, err
+		return stats, err
 	}
 	defer rows.Close()
 
-	var leases []ObjectLease
-
 	for rows.Next() {
-		var l ObjectLease
+		var lease ObjectLease
 		var createdStr, expireStr string
-		var datasetID, pieceCID string
+		var deletedStr sql.NullString
 
-		if err := rows.Scan(
-			&l.LeaseID,
-			&l.ObjectID,
-			&l.Bucket,
-			&l.Key,
-			&l.Wallet,
+		rows.Scan(
+			&lease.LeaseID,
+			&lease.ObjectID,
+			&lease.Wallet,
 			&createdStr,
 			&expireStr,
-			&datasetID,
-			&pieceCID,
-		); err != nil {
-			continue
+			&deletedStr,
+		)
+
+		lease.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)
+		lease.ExpireAt, _ = time.Parse(time.RFC3339Nano, expireStr)
+
+		if deletedStr.Valid {
+			t, _ := time.Parse(time.RFC3339Nano, deletedStr.String)
+			lease.DeletedAt = &t
 		}
 
-		createdAt, _ := time.Parse(time.RFC3339Nano, createdStr)
-		expireAt, _ := time.Parse(time.RFC3339Nano, expireStr)
+		status := CalculateLeaseStatus(lease)
 
-		l.CreatedAt = createdAt
-		l.ExpireAt = expireAt
-		l.StorageRef = StorageRef{
-			DataSetID: datasetID,
-			PieceCID:  pieceCID,
+		switch status {
+		case LeaseActive:
+			stats.ActiveObjects++
+		case LeaseExpired:
+			stats.ExpiredObjects++
+		case LeaseDeleted:
+			stats.DeletedObjects++
 		}
-
-		leases = append(leases, l)
 	}
 
-	return leases, nil
-}
-
-func (s *SQLiteStore) MarkDeleted(leaseID string) {
-	_, _ = s.db.Exec(
-		`UPDATE leases SET deleted_at = ? WHERE lease_id = ?`,
-		iso(time.Now()),
-		leaseID,
-	)
+	return stats, nil
 }
 

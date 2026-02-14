@@ -15,13 +15,10 @@ func main() {
 	}
 	defer store.Close()
 
-	lifecycle.StartExpirationScheduler(store)
-
 	adapter := storage.NewMockAdapter()
 
 	server := api.NewServer(store, adapter)
 
-	log.Println("Qave API running on :8080")
 	log.Fatal(server.Start(":8080"))
 }
 
